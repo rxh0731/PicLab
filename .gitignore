@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+piclab.log
+piclab.log.old
+.pytest_cache/
+build/
+dist/
+output/
+*.spec
+*.fontlab-wal
+*.fontlab-shm
+
