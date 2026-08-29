@@ -19,6 +19,18 @@ class TextRegionCandidate:
     color: str
 
 
+@dataclass(frozen=True, slots=True)
+class _DetectedTextLine:
+    """OCR 返回的一条文字行及其稳定几何量。"""
+
+    box: np.ndarray
+    score: float
+    vertical: bool
+    center: float
+    major_length: float
+    minor_length: float
+
+
 @lru_cache(maxsize=1)
 def _rapidocr_engine() -> object:
     """延迟创建文字行检测器，避免图片实验室启动时加载模型。"""
@@ -33,6 +45,177 @@ def _rapidocr_engine() -> object:
             "Global.use_rec": False,
         }
     )
+
+
+def _regularize_text_lines(
+    lines: list[_DetectedTextLine],
+) -> tuple[list[_DetectedTextLine], float]:
+    """去除重复文字行，并把行中心吸附到统一的版面网格。"""
+
+    if not lines:
+        return [], 0.0
+    typical_minor = float(np.median([line.minor_length for line in lines]))
+    duplicate_distance = max(3.0, typical_minor * 0.34)
+    retained: list[_DetectedTextLine] = []
+    for line in sorted(lines, key=lambda item: (-item.score, item.center)):
+        if any(abs(line.center - item.center) < duplicate_distance for item in retained):
+            continue
+        retained.append(line)
+    retained.sort(key=lambda item: item.center)
+    if len(retained) < 2:
+        return retained, max(6.0, min(96.0, typical_minor))
+
+    centers = np.asarray([line.center for line in retained], dtype=np.float64)
+    gaps = np.diff(centers)
+    plausible = gaps[
+        (gaps >= max(4.0, typical_minor * 0.52))
+        & (gaps <= max(8.0, typical_minor * 1.72))
+    ]
+    valid_gaps = gaps[gaps >= 4.0]
+    if plausible.size:
+        pitch = float(np.median(plausible))
+    elif valid_gaps.size:
+        pitch = float(np.percentile(valid_gaps, 40.0))
+    else:
+        pitch = typical_minor
+    pitch = max(6.0, min(96.0, pitch))
+
+    indices = np.zeros(len(centers), dtype=np.int32)
+    for index in range(1, len(centers)):
+        step = max(1, int(round((centers[index] - centers[index - 1]) / pitch)))
+        indices[index] = indices[index - 1] + step
+    if len(centers) >= 3 and int(indices[-1]) > 0:
+        fitted_pitch, fitted_origin = np.polyfit(indices, centers, 1)
+        if pitch * 0.78 <= fitted_pitch <= pitch * 1.22:
+            pitch = float(fitted_pitch)
+            origin = float(fitted_origin)
+        else:
+            origin = float(np.median(centers - indices * pitch))
+    else:
+        origin = float(np.median(centers - indices * pitch))
+
+    by_index = {int(index): line for index, line in zip(indices, retained)}
+    completed: list[_DetectedTextLine] = []
+    for grid_index in range(int(indices[0]), int(indices[-1]) + 1):
+        target_center = origin + grid_index * pitch
+        line = by_index.get(grid_index)
+        if line is None:
+            nearest = min(retained, key=lambda item: abs(item.center - target_center))
+            score = max(0.35, nearest.score * 0.78)
+            box = np.array(nearest.box, dtype=np.float32, copy=True)
+            vertical = nearest.vertical
+            major_length = nearest.major_length
+            minor_length = nearest.minor_length
+        else:
+            score = line.score
+            box = np.array(line.box, dtype=np.float32, copy=True)
+            vertical = line.vertical
+            major_length = line.major_length
+            minor_length = line.minor_length
+        axis = 0 if vertical else 1
+        current_center = float(np.mean(box[:, axis]))
+        box[:, axis] += target_center - current_center
+        completed.append(
+            _DetectedTextLine(
+                box=box,
+                score=score,
+                vertical=vertical,
+                center=float(target_center),
+                major_length=major_length,
+                minor_length=minor_length,
+            )
+        )
+    return completed, pitch
+
+
+def _major_grid_geometry(
+    mask: np.ndarray,
+    *,
+    vertical: bool,
+    expected_pitch: float,
+    lines: list[_DetectedTextLine],
+) -> tuple[float, float]:
+    """从整页墨迹投影估计字符方向的节距和公共边界相位。"""
+
+    projection = np.mean(mask, axis=1 if vertical else 0).astype(np.float32)
+    if projection.size < 8 or float(np.ptp(projection)) < 0.002:
+        start = min(float(np.min(line.box[:, 1 if vertical else 0])) for line in lines)
+        return expected_pitch, start % expected_pitch
+    smoothed = cv2.GaussianBlur(
+        projection.reshape(-1, 1),
+        (1, 0),
+        sigmaX=0.0,
+        sigmaY=max(0.8, expected_pitch * 0.032),
+    ).reshape(-1)
+    axis = 1 if vertical else 0
+    start = max(0.0, min(float(np.min(line.box[:, axis])) for line in lines))
+    end = min(
+        float(projection.size - 1),
+        max(float(np.max(line.box[:, axis])) for line in lines),
+    )
+    deviation_scale = max(0.001, float(np.std(smoothed)))
+    pitch_steps = max(9, int(round(expected_pitch * 1.2)))
+    pitches = np.linspace(expected_pitch * 0.86, expected_pitch * 1.14, pitch_steps)
+    best: tuple[float, float, float] | None = None
+    sample_axis = np.arange(projection.size, dtype=np.float32)
+    for pitch in pitches:
+        phase_steps = max(12, int(round(pitch * 2.0)))
+        for phase in np.linspace(0.0, pitch, phase_steps, endpoint=False):
+            first_index = int(np.floor((start - phase) / pitch)) - 1
+            last_index = int(np.ceil((end - phase) / pitch)) + 1
+            boundaries = phase + np.arange(first_index, last_index + 1) * pitch
+            boundaries = boundaries[(boundaries >= start) & (boundaries <= end)]
+            if boundaries.size < 3:
+                continue
+            centers = boundaries[:-1] + pitch * 0.5
+            boundary_values = []
+            for offset in (-1.0, 0.0, 1.0):
+                boundary_values.append(
+                    np.interp(boundaries + offset, sample_axis, smoothed)
+                )
+            boundary_cost = float(np.mean(boundary_values))
+            center_level = (
+                float(np.mean(np.interp(centers, sample_axis, smoothed)))
+                if centers.size
+                else boundary_cost
+            )
+            deviation = abs(float(pitch) - expected_pitch) / expected_pitch
+            cost = boundary_cost - center_level * 0.12 + deviation * deviation_scale * 0.22
+            candidate = (cost, float(pitch), float(phase))
+            if best is None or candidate < best:
+                best = candidate
+    if best is None:
+        return expected_pitch, start % expected_pitch
+    return best[1], best[2]
+
+
+def _refine_cell_to_ink(
+    polygon: np.ndarray,
+    mask: np.ndarray,
+    *,
+    major_pitch: float,
+    cross_pitch: float,
+) -> np.ndarray:
+    """用当前网格单元内的墨迹重心消除少量 OCR/网格相位偏差。"""
+
+    height, width = mask.shape[:2]
+    x1 = max(0, int(np.floor(np.min(polygon[:, 0]))))
+    y1 = max(0, int(np.floor(np.min(polygon[:, 1]))))
+    x2 = min(width, int(np.ceil(np.max(polygon[:, 0]))) + 1)
+    y2 = min(height, int(np.ceil(np.max(polygon[:, 1]))) + 1)
+    if x2 <= x1 or y2 <= y1:
+        return polygon
+    local = mask[y1:y2, x1:x2]
+    ys, xs = np.nonzero(local)
+    if xs.size < 4:
+        return polygon
+    ink_center = np.asarray((x1 + float(np.mean(xs)), y1 + float(np.mean(ys))))
+    polygon_center = np.mean(polygon, axis=0)
+    shift = ink_center - polygon_center
+    # 字形本身可能偏旁不对称，只吸收小幅偏差，避免把网格跟着字形重心拉歪。
+    limit = np.asarray((cross_pitch * 0.18, major_pitch * 0.18), dtype=np.float32)
+    shift = np.clip(shift, -limit, limit)
+    return polygon + shift.astype(np.float32)
 
 
 def _line_guided_candidates(
@@ -50,7 +233,7 @@ def _line_guided_candidates(
         return ()
     if boxes.ndim != 3 or boxes.shape[1:] != (4, 2) or not scores:
         return ()
-    line_items: list[tuple[np.ndarray, float, bool, float]] = []
+    line_items: list[_DetectedTextLine] = []
     for box, score in zip(boxes, scores):
         horizontal_length = (
             np.linalg.norm(box[1] - box[0]) + np.linalg.norm(box[2] - box[3])
@@ -64,59 +247,36 @@ def _line_guided_candidates(
         if major < 24.0 or minor < 3.0 or major / max(1.0, minor) < 2.2:
             continue
         center = float(np.mean(box[:, 0] if vertical else box[:, 1]))
-        line_items.append((box, score, vertical, center))
+        line_items.append(
+            _DetectedTextLine(
+                box=np.array(box, dtype=np.float32, copy=True),
+                score=score,
+                vertical=vertical,
+                center=center,
+                major_length=major,
+                minor_length=minor,
+            )
+        )
     if len(line_items) < 2:
         return ()
-    dominant_vertical = sum(item[2] for item in line_items) >= len(line_items) / 2
-    lines = [item for item in line_items if item[2] == dominant_vertical]
-    centers = sorted(item[3] for item in lines)
-    gaps = [
-        second - first
-        for first, second in zip(centers, centers[1:])
-        if second - first >= 4.0
-    ]
-    if not gaps:
+    dominant_vertical = sum(item.vertical for item in line_items) >= len(line_items) / 2
+    lines = [item for item in line_items if item.vertical == dominant_vertical]
+    retained, cross_pitch = _regularize_text_lines(lines)
+    if len(retained) < 2 or cross_pitch <= 0.0:
         return ()
-    pitch = float(np.percentile(gaps, 40.0))
-    pitch = max(6.0, min(96.0, pitch))
-    # 同一文字行可能被检测器重复返回；中心过近时只保留置信度较高者。
-    retained: list[tuple[np.ndarray, float, bool, float]] = []
-    for item in sorted(lines, key=lambda value: (-value[1], value[3])):
-        if any(abs(item[3] - existing[3]) < pitch * 0.55 for existing in retained):
-            continue
-        retained.append(item)
-    retained.sort(key=lambda value: value[3])
-    if len(retained) >= 3:
-        first_center = retained[0][3]
-        last_center = retained[-1][3]
-        grid_count = max(1, int(round((last_center - first_center) / pitch)))
-        completed: list[tuple[np.ndarray, float, bool, float]] = []
-        for grid_index in range(grid_count + 1):
-            center = first_center + grid_index * pitch
-            nearest = min(retained, key=lambda value: abs(value[3] - center))
-            if abs(nearest[3] - center) <= pitch * 0.58:
-                completed.append(nearest)
-                continue
-            shifted = np.array(nearest[0], dtype=np.float32, copy=True)
-            if dominant_vertical:
-                shifted[:, 0] += center - nearest[3]
-            else:
-                shifted[:, 1] += center - nearest[3]
-            completed.append((shifted, max(0.35, nearest[1] * 0.78), dominant_vertical, center))
-        # 去除多个网格位置吸附到同一条检测线产生的重复项。
-        deduplicated: list[tuple[np.ndarray, float, bool, float]] = []
-        seen_centers: set[int] = set()
-        for item in completed:
-            key = int(round(item[3] / max(1.0, pitch * 0.25)))
-            if key in seen_centers:
-                continue
-            seen_centers.add(key)
-            deduplicated.append(item)
-        retained = deduplicated
+    major_pitch, major_phase = _major_grid_geometry(
+        mask,
+        vertical=dominant_vertical,
+        expected_pitch=cross_pitch,
+        lines=retained,
+    )
 
     height, width = rgb.shape[:2]
     output: list[TextRegionCandidate] = []
-    for box, line_score, vertical, _center in retained:
+    for line in retained:
+        box = line.box
+        line_score = line.score
+        vertical = line.vertical
         if vertical:
             start_center = (box[0] + box[1]) / 2.0
             end_center = (box[3] + box[2]) / 2.0
@@ -134,12 +294,25 @@ def _line_guided_candidates(
         if cross_length <= 1.0:
             continue
         unit_cross = cross_vector / cross_length
-        half_cross = min(cross_length * 0.48, pitch * 0.47)
-        cell_count = max(1, int(round(line_length / pitch)))
-        cell_length = line_length / cell_count
-        for index in range(cell_count):
-            center = start_center + unit_major * ((index + 0.5) * cell_length)
-            half_major = min(cell_length * 0.48, pitch * 0.49)
+        half_cross = min(cross_length * 0.48, cross_pitch * 0.46)
+        major_axis = 1 if vertical else 0
+        axis_component = float(unit_major[major_axis])
+        if abs(axis_component) < 0.5:
+            continue
+        axis_start = max(0.0, float(np.min(box[:, major_axis])))
+        axis_end = min(
+            float((height if vertical else width) - 1),
+            float(np.max(box[:, major_axis])),
+        )
+        first_index = int(np.floor((axis_start - major_phase) / major_pitch)) - 1
+        last_index = int(np.ceil((axis_end - major_phase) / major_pitch)) + 1
+        for grid_index in range(first_index, last_index + 1):
+            axis_center = major_phase + (grid_index + 0.5) * major_pitch
+            if not axis_start - major_pitch * 0.18 <= axis_center <= axis_end + major_pitch * 0.18:
+                continue
+            distance = (axis_center - float(start_center[major_axis])) / axis_component
+            center = start_center + unit_major * distance
+            half_major = major_pitch * 0.46 / abs(axis_component)
             polygon_array = np.asarray(
                 [
                     center - unit_major * half_major - unit_cross * half_cross,
@@ -148,6 +321,12 @@ def _line_guided_candidates(
                     center + unit_major * half_major - unit_cross * half_cross,
                 ],
                 dtype=np.float32,
+            )
+            polygon_array = _refine_cell_to_ink(
+                polygon_array,
+                mask,
+                major_pitch=major_pitch,
+                cross_pitch=cross_pitch,
             )
             x1 = max(0, int(np.floor(np.min(polygon_array[:, 0]))))
             y1 = max(0, int(np.floor(np.min(polygon_array[:, 1]))))
@@ -166,8 +345,8 @@ def _line_guided_candidates(
             )
             polygon = tuple(
                 (
-                    float(np.clip(point[0] / max(1, width - 1), 0.0, 1.0)),
-                    float(np.clip(point[1] / max(1, height - 1), 0.0, 1.0)),
+                    float(np.clip(point[0] / max(1, width), 0.0, 1.0)),
+                    float(np.clip(point[1] / max(1, height), 0.0, 1.0)),
                 )
                 for point in polygon_array
             )

@@ -1268,6 +1268,12 @@ class ImageLabPage(QWidget):
 
     def _set_view_mode(self, mode: str) -> None:
         self._canvas.set_view_mode(mode)
+        selecting = mode == VIEW_REGIONS and not self._region_draw_active
+        self._region_select_button.blockSignals(True)
+        self._region_select_button.setChecked(selecting)
+        self._region_select_button.blockSignals(False)
+        if mode != VIEW_REGIONS and not self._region_draw_active:
+            self._canvas.set_region_mode(False)
         self._schedule_detail_preview()
 
     def _canvas_zoom_changed(self, value: int) -> None:

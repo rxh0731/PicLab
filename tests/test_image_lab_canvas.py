@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QImage, QMouseEvent, QWheelEvent
 from PySide6.QtWidgets import QApplication
 
-from ui.widgets.image_lab_canvas import VIEW_ORIGINAL, ImageLabCanvas
+from ui.widgets.image_lab_canvas import VIEW_ORIGINAL, VIEW_REGIONS, ImageLabCanvas
 
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -212,6 +213,106 @@ class ImageLabCanvasTests(unittest.TestCase):
         self.assertGreater(center.red(), 220)
         self.assertLess(center.green(), 40)
         self.assertLess(outside.red(), 10)
+        canvas.deleteLater()
+
+    def test_region_outline_remains_one_pixel_when_zoomed(self) -> None:
+        canvas = ImageLabCanvas()
+        source = np.full((100, 200, 3), 255, dtype=np.uint8)
+        alpha = np.zeros((100, 200), dtype=np.uint8)
+        canvas.set_preview(
+            source,
+            source,
+            alpha,
+            alpha,
+            source_width=200,
+            source_height=100,
+        )
+        canvas.set_regions(
+            (
+                SimpleNamespace(
+                    region_id="区域-0001",
+                    polygon=((0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)),
+                    status="confirmed",
+                    color="#28a6c1",
+                ),
+            )
+        )
+        canvas.set_view_mode("regions")
+        canvas.set_zoom(2.0)
+        rendered = QImage(canvas.size(), QImage.Format.Format_ARGB32)
+        rendered.fill(Qt.GlobalColor.white)
+        canvas.render(rendered)
+
+        colored_columns = [
+            x
+            for x in range(76, 85)
+            if rendered.pixelColor(x, 100) != rendered.pixelColor(75, 100)
+        ]
+        self.assertEqual(colored_columns, [80])
+        canvas.deleteLater()
+
+    def test_regions_view_allows_selecting_without_pressing_select_button(self) -> None:
+        canvas = self._canvas_with_preview()
+        canvas.set_regions(
+            (
+                SimpleNamespace(
+                    region_id="区域-0001",
+                    polygon=((0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)),
+                    status="pending",
+                    color="#28a6c1",
+                ),
+            )
+        )
+        selected: list[str] = []
+        canvas.region_clicked.connect(selected.append)
+        canvas.set_view_mode(VIEW_REGIONS)
+        position = QPointF(100.0, 50.0)
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            position,
+            position,
+            position,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        canvas.mousePressEvent(event)
+
+        self.assertEqual(selected, ["区域-0001"])
+        self.assertTrue(event.isAccepted())
+        canvas.deleteLater()
+
+    def test_region_border_hit_has_tolerance(self) -> None:
+        canvas = self._canvas_with_preview()
+        canvas.set_regions(
+            (
+                SimpleNamespace(
+                    region_id="区域-0001",
+                    polygon=((0.2, 0.2), (0.8, 0.2), (0.8, 0.8), (0.2, 0.8)),
+                    status="pending",
+                    color="#28a6c1",
+                ),
+            )
+        )
+        selected: list[str] = []
+        canvas.region_clicked.connect(selected.append)
+        canvas.set_view_mode(VIEW_REGIONS)
+        # 区域左边界为 40 像素，点击一像素线外仍应能命中。
+        position = QPointF(37.0, 50.0)
+        event = QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            position,
+            position,
+            position,
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+        canvas.mousePressEvent(event)
+
+        self.assertEqual(selected, ["区域-0001"])
         canvas.deleteLater()
 
 

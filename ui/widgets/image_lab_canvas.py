@@ -10,6 +10,8 @@ from PySide6.QtGui import (
     QKeyEvent,
     QMouseEvent,
     QPainter,
+    QPainterPath,
+    QPainterPathStroker,
     QPen,
     QPolygonF,
     QWheelEvent,
@@ -371,6 +373,11 @@ class ImageLabCanvas(QWidget):
         if mode not in {VIEW_ORIGINAL, VIEW_CLEAN, VIEW_LAYER, VIEW_REVIEW, VIEW_REGIONS}:
             raise ValueError("不支持的图片实验室预览模式。")
         self._view_mode = mode
+        # 文字区域视图本身就是复核工作区，进入后允许直接点击区域。
+        if mode == VIEW_REGIONS:
+            self._region_mode = True
+        elif not self._region_draw_mode:
+            self._region_mode = False
         self.update()
 
     def set_tool(self, tool: str) -> None:
@@ -478,11 +485,28 @@ class ImageLabCanvas(QWidget):
             ]
         )
 
+    @staticmethod
+    def _region_hit(polygon: QPolygonF, point: QPointF) -> bool:
+        """判断点击是否落在区域内部或一像素边框附近。"""
+
+        if polygon.containsPoint(point, Qt.FillRule.OddEvenFill):
+            return True
+        if polygon.count() < 2:
+            return False
+        path = QPainterPath()
+        path.moveTo(polygon.at(0))
+        for index in range(1, polygon.count()):
+            path.lineTo(polygon.at(index))
+        path.closeSubpath()
+        stroker = QPainterPathStroker()
+        stroker.setWidth(8.0)
+        return stroker.createStroke(path).contains(point)
+
     def _draw_regions(self, painter: QPainter) -> None:
         if not self._regions:
             return
         painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         for region in self._regions:
             polygon = self._region_polygon(region)
             if polygon.isEmpty():
@@ -492,20 +516,16 @@ class ImageLabCanvas(QWidget):
             selected = region_id == self._selected_region_id
             if selected:
                 color = QColor("#d95368")
-                width = 3.0
             elif status == "processed":
                 color = QColor("#57a773")
-                width = 2.0
             elif status == "confirmed":
                 color = QColor("#28a6c1")
-                width = 2.0
             elif status == "rejected":
                 color = QColor("#8d969d")
-                width = 1.5
             else:
                 color = QColor(str(getattr(region, "color", "#e0a522")))
-                width = 2.0
-            pen = QPen(color, max(1.0, width * max(0.75, self._zoom)))
+            pen = QPen(color, 1.0)
+            pen.setCosmetic(True)
             if status == "rejected":
                 pen.setStyle(Qt.PenStyle.DashLine)
             painter.setPen(pen)
@@ -520,7 +540,9 @@ class ImageLabCanvas(QWidget):
             right = max(self._region_start.x(), self._region_current.x())
             top = min(self._region_start.y(), self._region_current.y())
             bottom = max(self._region_start.y(), self._region_current.y())
-            painter.setPen(QPen(QColor("#e0a522"), 2.0, Qt.PenStyle.DashLine))
+            pen = QPen(QColor("#e0a522"), 1.0, Qt.PenStyle.DashLine)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
             painter.drawRect(QRectF(left, top, right - left, bottom - top))
         painter.restore()
 
@@ -607,10 +629,7 @@ class ImageLabCanvas(QWidget):
                         event.accept()
                         return
             for region in reversed(self._regions):
-                if self._region_polygon(region).containsPoint(
-                    event.position(),
-                    Qt.FillRule.OddEvenFill,
-                ):
+                if self._region_hit(self._region_polygon(region), event.position()):
                     self._selected_region_id = str(getattr(region, "region_id", ""))
                     self.update()
                     self.region_clicked.emit(self._selected_region_id)
