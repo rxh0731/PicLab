@@ -13,7 +13,7 @@ from core.image_cleanup import IMAGE_CLEANUP_ALGORITHM_VERSION, ImageCleanupOpti
 
 
 IMAGE_LAB_PROJECT_EXTENSION = ".fontlab"
-IMAGE_LAB_SCHEMA_VERSION = 5
+IMAGE_LAB_SCHEMA_VERSION = 6
 IMAGE_LAB_REGION_STATUSES = {"pending", "confirmed", "rejected", "processed"}
 
 
@@ -30,8 +30,8 @@ class ImageLabStroke:
     points: tuple[tuple[float, float], ...]
 
     def __post_init__(self) -> None:
-        if self.tool not in {"cover", "restore"}:
-            raise ValueError("人工笔画工具必须是覆盖或还原。")
+        if self.tool not in {"cover", "restore", "ink", "erase"}:
+            raise ValueError("人工笔画工具必须是白色画笔、墨色画笔或橡皮擦。")
         if not 0.5 <= float(self.width) <= 4096.0:
             raise ValueError("人工笔画宽度超出有效范围。")
         if not self.points:
@@ -46,6 +46,30 @@ class ImageLabStroke:
             normalized.append((x, y))
         object.__setattr__(self, "width", float(self.width))
         object.__setattr__(self, "points", tuple(normalized))
+
+
+@dataclass(frozen=True, slots=True)
+class ImageLabLearningSample:
+    """已完成文字区域的学习样本引用，不在项目库中保存图片像素。"""
+
+    region_id: str
+    source_path: str
+    polygon: tuple[tuple[float, float], ...]
+    quality: str = "confirmed"
+    created_at: str = field(default_factory=_utc_now)
+
+    def __post_init__(self) -> None:
+        if not str(self.region_id).strip() or not str(self.source_path).strip():
+            raise ValueError("学习样本必须包含区域编号和原稿路径。")
+        if len(self.polygon) < 3:
+            raise ValueError("学习样本区域至少需要三个顶点。")
+        normalized = tuple((float(point[0]), float(point[1])) for point in self.polygon)
+        if any(not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0) for x, y in normalized):
+            raise ValueError("学习样本区域坐标必须位于图片范围内。")
+        object.__setattr__(self, "region_id", str(self.region_id))
+        object.__setattr__(self, "source_path", os.path.abspath(os.fspath(self.source_path)))
+        object.__setattr__(self, "polygon", normalized)
+        object.__setattr__(self, "quality", str(self.quality) or "confirmed")
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +121,7 @@ class ImageLabProject:
     options: ImageCleanupOptions = field(default_factory=ImageCleanupOptions)
     strokes: list[ImageLabStroke] = field(default_factory=list)
     regions: list[ImageLabRegion] = field(default_factory=list)
+    learning_samples: list[ImageLabLearningSample] = field(default_factory=list)
     restrict_to_regions: bool = True
     region_safe_margin: bool = True
     algorithm_version: int = IMAGE_CLEANUP_ALGORITHM_VERSION
@@ -170,6 +195,13 @@ class ImageLabProjectStore:
                         status TEXT NOT NULL
                             CHECK(status IN ('pending', 'confirmed', 'rejected', 'processed'))
                     );
+                    CREATE TABLE IF NOT EXISTS learning_samples (
+                        region_id TEXT PRIMARY KEY NOT NULL,
+                        source_path TEXT NOT NULL,
+                        polygon_json TEXT NOT NULL,
+                        quality TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
                     """
                 )
                 updated_at = _utc_now()
@@ -238,6 +270,23 @@ class ImageLabProjectStore:
                         for region in project.regions
                     ),
                 )
+                connection.execute("DELETE FROM learning_samples")
+                connection.executemany(
+                    """
+                    INSERT INTO learning_samples(region_id, source_path, polygon_json, quality, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        (
+                            sample.region_id,
+                            sample.source_path,
+                            json.dumps(sample.polygon, ensure_ascii=False),
+                            sample.quality,
+                            sample.created_at,
+                        )
+                        for sample in project.learning_samples
+                    ),
+                )
             project.project_path = target
             project.updated_at = updated_at
             project.algorithm_version = IMAGE_CLEANUP_ALGORITHM_VERSION
@@ -258,7 +307,7 @@ class ImageLabProjectStore:
                 connection.execute("SELECT key, value FROM project_meta").fetchall()
             )
             version = int(metadata.get("schema_version", "0"))
-            if version not in {2, 3, 4, IMAGE_LAB_SCHEMA_VERSION}:
+            if version not in {2, 3, 4, 5, IMAGE_LAB_SCHEMA_VERSION}:
                 raise ValueError(f"不支持的图片实验室项目版本：{version}。")
             strokes = [
                 ImageLabStroke(
@@ -290,6 +339,23 @@ class ImageLabProjectStore:
                         """
                     )
                 ]
+            learning_samples = []
+            sample_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='learning_samples'"
+            ).fetchone()
+            if sample_table is not None:
+                learning_samples = [
+                    ImageLabLearningSample(
+                        region_id=str(row[0]),
+                        source_path=str(row[1]),
+                        polygon=tuple(tuple(point) for point in json.loads(str(row[2]))),
+                        quality=str(row[3]),
+                        created_at=str(row[4]),
+                    )
+                    for row in connection.execute(
+                        "SELECT region_id, source_path, polygon_json, quality, created_at FROM learning_samples ORDER BY created_at"
+                    )
+                ]
         except sqlite3.DatabaseError as exc:
             raise ValueError(f"图片实验室项目文件已损坏：{exc}") from exc
         finally:
@@ -316,6 +382,7 @@ class ImageLabProjectStore:
             ),
             strokes=strokes,
             regions=regions,
+            learning_samples=learning_samples,
             restrict_to_regions=metadata.get("restrict_to_regions", "1") == "1",
             region_safe_margin=metadata.get("region_safe_margin", "1") == "1",
             algorithm_version=int(metadata.get("algorithm_version", "1")),

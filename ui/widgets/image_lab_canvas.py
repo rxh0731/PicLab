@@ -9,6 +9,7 @@ from PySide6.QtGui import (
     QImage,
     QKeyEvent,
     QMouseEvent,
+    QTabletEvent,
     QPainter,
     QPainterPath,
     QPainterPathStroker,
@@ -35,6 +36,7 @@ class ImageLabCanvas(QWidget):
     zoom_changed = Signal(int)
     pan_requested = Signal(QPoint)
     region_clicked = Signal(str)
+    region_selection_changed = Signal(object)
     region_drawn = Signal(object)
     region_edited = Signal(str, object)
 
@@ -62,12 +64,15 @@ class ImageLabCanvas(QWidget):
         self._zoom = 1.0
         self._drawing = False
         self._current_points: list[QPointF] = []
+        self._current_pressures: list[float] = []
+        self._pressure_enabled = True
         self._space_pan_held = False
         self._panning = False
         self._last_pan_global_position = QPointF()
         self._cursor_before_pan: QCursor | None = None
         self._regions: tuple[object, ...] = ()
         self._selected_region_id = ""
+        self._selected_region_ids: set[str] = set()
         self._region_mode = False
         self._region_draw_mode = False
         self._region_start = QPointF()
@@ -158,9 +163,13 @@ class ImageLabCanvas(QWidget):
         self._update_canvas_size()
         self.update()
 
-    def set_regions(self, regions: object, selected_region_id: str = "") -> None:
+    def set_regions(self, regions: object, selected_region_id: str = "", selected_region_ids: object = None) -> None:
         self._regions = tuple(regions or ())
-        self._selected_region_id = str(selected_region_id or "")
+        ids = {str(value) for value in (selected_region_ids or ()) if str(value)}
+        if not ids and selected_region_id:
+            ids = {str(selected_region_id)}
+        self._selected_region_ids = ids
+        self._selected_region_id = next(iter(ids), "")
         self._editing_region_id = ""
         self._editing_vertex_index = -1
         self._editing_polygon = ()
@@ -301,6 +310,7 @@ class ImageLabCanvas(QWidget):
         self._drawing = False
         self._regions = ()
         self._selected_region_id = ""
+        self._selected_region_ids.clear()
         self._region_draw_mode = False
         self._region_start = QPointF()
         self._region_current = QPointF()
@@ -381,9 +391,20 @@ class ImageLabCanvas(QWidget):
         self.update()
 
     def set_tool(self, tool: str) -> None:
-        if tool not in {"cover", "restore"}:
+        if tool not in {"cover", "restore", "ink", "erase"}:
             raise ValueError("不支持的人工清理工具。")
         self._tool = tool
+
+    def set_pressure_enabled(self, enabled: bool) -> None:
+        self._pressure_enabled = bool(enabled)
+
+    @property
+    def pressure_enabled(self) -> bool:
+        return self._pressure_enabled
+
+    @property
+    def selected_region_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._selected_region_ids))
 
     def set_brush_width(self, width: float) -> None:
         self._brush_width = max(1.0, min(4096.0, float(width)))
@@ -513,7 +534,7 @@ class ImageLabCanvas(QWidget):
                 continue
             region_id = str(getattr(region, "region_id", ""))
             status = str(getattr(region, "status", "pending"))
-            selected = region_id == self._selected_region_id
+            selected = region_id in self._selected_region_ids
             if selected:
                 color = QColor("#d95368")
             elif status == "processed":
@@ -594,6 +615,65 @@ class ImageLabCanvas(QWidget):
         bottom = int(max(first.y(), other.y())) + radius
         return QRect(QPoint(left, top), QPoint(right, bottom)).intersected(self.rect())
 
+    def _begin_drawing(self, point: QPointF, pressure: float = 1.0) -> None:
+        self._drawing = True
+        self._current_points = [point]
+        self._current_pressures = [max(0.05, min(1.0, float(pressure)))]
+        self.grabMouse()
+        self.update(self._stroke_dirty_rect(point))
+
+    def _append_drawing_point(self, point: QPointF, pressure: float = 1.0) -> None:
+        if not self._drawing:
+            return
+        if not self._current_points or (point - self._current_points[-1]).manhattanLength() >= 1.0:
+            previous = self._current_points[-1]
+            self._current_points.append(point)
+            self._current_pressures.append(max(0.05, min(1.0, float(pressure))))
+            self.update(self._stroke_dirty_rect(previous, point))
+
+    def _finish_drawing(self) -> None:
+        if not self._drawing:
+            return
+        self._drawing = False
+        self.releaseMouse()
+        dirty_region = QRect()
+        for point in self._current_points:
+            dirty_region = dirty_region.united(self._stroke_dirty_rect(point))
+        points = tuple(
+            (max(0.0, min(1.0, point.x() / max(1, self.width()))),
+             max(0.0, min(1.0, point.y() / max(1, self.height()))))
+            for point in self._current_points
+        )
+        pressures = self._current_pressures
+        self._current_points.clear()
+        self._current_pressures.clear()
+        self.update(dirty_region)
+        if points:
+            average = sum(pressures) / max(1, len(pressures))
+            effective_width = self._brush_width * (0.35 + 0.65 * average) if self._pressure_enabled else self._brush_width
+            self.stroke_finished.emit(self._tool, effective_width, points)
+
+    def tabletPressEvent(self, event: QTabletEvent) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton and not self._source.isNull() and self._view_mode != VIEW_ORIGINAL and not self._region_mode:
+            self._begin_drawing(QPointF(event.position()), event.pressure())
+            event.accept()
+            return
+        super().tabletPressEvent(event)
+
+    def tabletMoveEvent(self, event: QTabletEvent) -> None:  # noqa: N802
+        if self._drawing:
+            self._append_drawing_point(QPointF(event.position()), event.pressure())
+            event.accept()
+            return
+        super().tabletMoveEvent(event)
+
+    def tabletReleaseEvent(self, event: QTabletEvent) -> None:  # noqa: N802
+        if self._drawing:
+            self._finish_drawing()
+            event.accept()
+            return
+        super().tabletReleaseEvent(event)
+
     def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802
         if (
             event.button() == Qt.MouseButton.LeftButton
@@ -618,8 +698,11 @@ class ImageLabCanvas(QWidget):
                     continue
                 for index in range(polygon.count()):
                     if (polygon.at(index) - event.position()).manhattanLength() <= 12.0:
-                        self._selected_region_id = str(getattr(region, "region_id", ""))
+                        region_id = str(getattr(region, "region_id", ""))
+                        self._selected_region_ids = {region_id}
+                        self._selected_region_id = region_id
                         self.region_clicked.emit(self._selected_region_id)
+                        self.region_selection_changed.emit((region_id,))
                         polygon = self._region_polygon(region)
                         self._editing_region_id = self._selected_region_id
                         self._editing_vertex_index = index
@@ -630,9 +713,19 @@ class ImageLabCanvas(QWidget):
                         return
             for region in reversed(self._regions):
                 if self._region_hit(self._region_polygon(region), event.position()):
-                    self._selected_region_id = str(getattr(region, "region_id", ""))
+                    region_id = str(getattr(region, "region_id", ""))
+                    modifiers = event.modifiers()
+                    if modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier):
+                        if region_id in self._selected_region_ids:
+                            self._selected_region_ids.remove(region_id)
+                        else:
+                            self._selected_region_ids.add(region_id)
+                    else:
+                        self._selected_region_ids = {region_id}
+                    self._selected_region_id = region_id
                     self.update()
                     self.region_clicked.emit(self._selected_region_id)
+                    self.region_selection_changed.emit(tuple(sorted(self._selected_region_ids)))
                     event.accept()
                     return
         if event.button() == Qt.MouseButton.LeftButton and self._space_pan_held:
@@ -647,10 +740,7 @@ class ImageLabCanvas(QWidget):
             and not self._source.isNull()
             and self._view_mode != VIEW_ORIGINAL
         ):
-            self._drawing = True
-            self._current_points = [QPointF(event.position())]
-            self.grabMouse()
-            self.update(self._stroke_dirty_rect(self._current_points[0]))
+            self._begin_drawing(QPointF(event.position()))
             event.accept()
             return
         super().mousePressEvent(event)
@@ -688,9 +778,7 @@ class ImageLabCanvas(QWidget):
             if not self._current_points or (
                 QPointF(point) - self._current_points[-1]
             ).manhattanLength() >= 1.0:
-                previous = self._current_points[-1]
-                self._current_points.append(point)
-                self.update(self._stroke_dirty_rect(previous, point))
+                self._append_drawing_point(point)
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -757,22 +845,7 @@ class ImageLabCanvas(QWidget):
             event.accept()
             return
         if self._drawing and event.button() == Qt.MouseButton.LeftButton:
-            self._drawing = False
-            self.releaseMouse()
-            dirty_region = QRect()
-            for point in self._current_points:
-                dirty_region = dirty_region.united(self._stroke_dirty_rect(point))
-            points = tuple(
-                (
-                    max(0.0, min(1.0, point.x() / max(1, self.width()))),
-                    max(0.0, min(1.0, point.y() / max(1, self.height()))),
-                )
-                for point in self._current_points
-            )
-            self._current_points.clear()
-            self.update(dirty_region)
-            if points:
-                self.stroke_finished.emit(self._tool, self._brush_width, points)
+            self._finish_drawing()
             event.accept()
             return
         super().mouseReleaseEvent(event)

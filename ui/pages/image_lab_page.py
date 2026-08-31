@@ -47,6 +47,7 @@ from data.image_lab_project_store import (
     IMAGE_LAB_REGION_STATUSES,
     ImageLabProject,
     ImageLabRegion,
+    ImageLabLearningSample,
     ImageLabProjectStore,
     ImageLabStroke,
 )
@@ -161,10 +162,12 @@ class ImageLabPage(QWidget):
         self._application_filter_installed = False
         self._shutting_down = False
         self._selected_region_id = ""
+        self._selected_region_ids: set[str] = set()
         self._regions_auto_detected = False
         self._region_draw_active = False
         self._region_undo_stack: list[list[ImageLabRegion]] = []
         self._merge_source_id = ""
+        self._control_groups: dict[str, QGroupBox] = {}
         self._build_ui()
         self.destroyed.connect(self._page_destroyed)
         self._connect_shortcuts()
@@ -251,6 +254,7 @@ class ImageLabPage(QWidget):
         footer.addWidget(self._progress)
         footer.addWidget(self._stop_button)
         root.addWidget(footer_frame)
+        self._set_stage_controls(0)
 
     def _build_workflow_sidebar(self) -> QWidget:
         """构建按处理阶段组织的工作流导航，不改变各阶段的后台处理逻辑。"""
@@ -326,6 +330,21 @@ class ImageLabPage(QWidget):
             row.setProperty("active", active)
             row.style().unpolish(row)
             row.style().polish(row)
+        self._set_stage_controls(index)
+
+    def _set_stage_controls(self, index: int) -> None:
+        """仅显示当前环节控件，切换时保留各控件参数。"""
+        if not self._control_groups:
+            return
+        visible = {
+            "process": index in {0, 3},
+            "review": index in {1, 2, 3, 4},
+            "paint": index in {3, 4},
+            "metrics": index in {3, 4, 5},
+            "export": index in {5, 6},
+        }
+        for key, group in self._control_groups.items():
+            group.setVisible(visible.get(key, True))
 
     def _workflow_step_clicked(self, index: int) -> None:
         """把流程导航映射到已有功能入口。"""
@@ -360,6 +379,7 @@ class ImageLabPage(QWidget):
         layout.setSpacing(10)
 
         process_group = QGroupBox("智能清理")
+        self._control_groups["process"] = process_group
         process_layout = QVBoxLayout(process_group)
         mode_row = QHBoxLayout()
         mode_row.addWidget(QLabel("处理方式"))
@@ -398,23 +418,30 @@ class ImageLabPage(QWidget):
         layout.addWidget(process_group)
 
         manual_group = QGroupBox("人工引导")
+        self._control_groups["paint"] = manual_group
         manual_layout = QVBoxLayout(manual_group)
         tool_row = QHBoxLayout()
-        self._cover_button = QPushButton("清除背景")
+        self._cover_button = QPushButton("白色画笔")
         self._cover_button.setCheckable(True)
         self._cover_button.setChecked(True)
-        self._restore_button = QPushButton("保护文字")
+        self._restore_button = QPushButton("墨色画笔")
         self._restore_button.setCheckable(True)
         tool_group = QButtonGroup(self)
         tool_group.setExclusive(True)
         tool_group.addButton(self._cover_button)
         tool_group.addButton(self._restore_button)
+        self._erase_button = QPushButton("橡皮擦")
+        self._erase_button.setCheckable(True)
+        tool_group.addButton(self._erase_button)
         self._cover_button.clicked.connect(lambda: self._canvas.set_tool("cover"))
         self._restore_button.clicked.connect(lambda: self._canvas.set_tool("restore"))
+        self._erase_button.clicked.connect(lambda: self._canvas.set_tool("erase"))
         self._cover_button.clicked.connect(self._leave_region_mode)
         self._restore_button.clicked.connect(self._leave_region_mode)
+        self._erase_button.clicked.connect(self._leave_region_mode)
         tool_row.addWidget(self._cover_button)
         tool_row.addWidget(self._restore_button)
+        tool_row.addWidget(self._erase_button)
         manual_layout.addLayout(tool_row)
         brush_row = QHBoxLayout()
         brush_row.addWidget(QLabel("笔触大小"))
@@ -427,6 +454,10 @@ class ImageLabPage(QWidget):
         self._brush_slider.setValue(80)
         self._brush_slider.valueChanged.connect(self._brush_changed)
         manual_layout.addWidget(self._brush_slider)
+        self._pressure_check = QCheckBox("启用绘图板压力")
+        self._pressure_check.setChecked(True)
+        self._pressure_check.toggled.connect(self._canvas.set_pressure_enabled)
+        manual_layout.addWidget(self._pressure_check)
         edit_row = QHBoxLayout()
         self._undo_button = QPushButton("撤销")
         self._clear_button = QPushButton("清除人工修改")
@@ -438,6 +469,7 @@ class ImageLabPage(QWidget):
         layout.addWidget(manual_group)
 
         region_group = QGroupBox("文字区域复核")
+        self._control_groups["review"] = region_group
         region_layout = QVBoxLayout(region_group)
         self._region_summary = QLabel("尚未检测文字区域")
         self._region_summary.setWordWrap(True)
@@ -487,16 +519,21 @@ class ImageLabPage(QWidget):
         self._region_margin_check.toggled.connect(self._region_options_changed)
         region_layout.addWidget(self._region_restrict_check)
         region_layout.addWidget(self._region_margin_check)
-        self._region_process_button = QPushButton("处理已确认区域")
+        self._region_process_button = QPushButton("单字优化")
         self._region_process_button.setObjectName("primaryButton")
         self._region_process_button.clicked.connect(self._process_confirmed_regions)
         region_layout.addWidget(self._region_process_button)
+        self._learn_button = QPushButton("标记完成并加入学习")
+        self._learn_button.setObjectName("primaryButton")
+        self._learn_button.clicked.connect(self._mark_selected_regions_learned)
+        region_layout.addWidget(self._learn_button)
         self._region_undo_button = QPushButton("撤销区域修改")
         self._region_undo_button.clicked.connect(self._undo_region_change)
         region_layout.addWidget(self._region_undo_button)
         layout.addWidget(region_group)
 
         metrics_group = QGroupBox("处理摘要")
+        self._control_groups["metrics"] = metrics_group
         metrics_layout = QVBoxLayout(metrics_group)
         self._metrics_label = QLabel("尚未生成预览")
         self._metrics_label.setWordWrap(True)
@@ -507,6 +544,7 @@ class ImageLabPage(QWidget):
         layout.addWidget(metrics_group)
 
         export_group = QGroupBox("完整尺寸导出")
+        self._control_groups["export"] = export_group
         export_layout = QVBoxLayout(export_group)
         self._export_photoshop_button = QPushButton("导出 Photoshop 文件")
         self._export_result_button = QPushButton("导出清理效果")
@@ -609,6 +647,7 @@ class ImageLabPage(QWidget):
         self._canvas = ImageLabCanvas()
         self._canvas.stroke_finished.connect(self._stroke_finished)
         self._canvas.region_clicked.connect(self._select_region)
+        self._canvas.region_selection_changed.connect(self._select_regions)
         self._canvas.region_drawn.connect(self._add_manual_region)
         self._canvas.region_edited.connect(self._edit_region_polygon)
         self._canvas.zoom_changed.connect(self._canvas_zoom_changed)
@@ -770,6 +809,7 @@ class ImageLabPage(QWidget):
         self._preview = None
         self._dirty = dirty
         self._selected_region_id = ""
+        self._selected_region_ids.clear()
         self._regions_auto_detected = bool(project.regions)
         self._region_draw_active = False
         self._region_undo_stack.clear()
@@ -818,7 +858,7 @@ class ImageLabPage(QWidget):
         if self._shutting_down:
             return
         regions = self._project.regions if self._project is not None else []
-        self._canvas.set_regions(regions, self._selected_region_id)
+        self._canvas.set_regions(regions, self._selected_region_id, self._selected_region_ids)
         counts = {status: 0 for status in IMAGE_LAB_REGION_STATUSES}
         for region in regions:
             counts[region.status] = counts.get(region.status, 0) + 1
@@ -869,6 +909,8 @@ class ImageLabPage(QWidget):
             self._project is not None
             and any(region.status == "confirmed" for region in regions)
         )
+        selected_ids = self._selected_region_ids or ({self._selected_region_id} if self._selected_region_id else set())
+        self._learn_button.setEnabled(bool(selected_ids) and self._project is not None)
         self._region_accept_high_button.setEnabled(
             any(region.status == "pending" and region.confidence >= 0.82 for region in regions)
         )
@@ -956,6 +998,7 @@ class ImageLabPage(QWidget):
             )
         self._project.regions = regions
         self._selected_region_id = regions[0].region_id if regions else ""
+        self._selected_region_ids = {self._selected_region_id} if self._selected_region_id else set()
         self._regions_auto_detected = True
         self._refresh_regions()
         if mark_dirty:
@@ -982,6 +1025,8 @@ class ImageLabPage(QWidget):
             self._merge_regions(self._merge_source_id, str(region_id))
             return
         self._selected_region_id = str(region_id)
+        if self._selected_region_id not in self._selected_region_ids:
+            self._selected_region_ids = {self._selected_region_id}
         self._refresh_regions()
         selected = next(
             (
@@ -996,11 +1041,21 @@ class ImageLabPage(QWidget):
                 f"当前区域：{selected.region_id}｜置信度 {selected.confidence * 100:.1f}%"
             )
 
+    def _select_regions(self, region_ids: object) -> None:
+        ids = {str(value) for value in (region_ids or ()) if str(value)}
+        self._selected_region_ids = ids
+        self._selected_region_id = next(iter(ids), "")
+        self._refresh_regions()
+        if ids:
+            self._status(f"已选择 {len(ids)} 个文字区域")
+
     def _set_selected_region_status(self, status: str) -> None:
         if self._project is None or status not in IMAGE_LAB_REGION_STATUSES:
             return
+        selected_ids = self._selected_region_ids or ({self._selected_region_id} if self._selected_region_id else set())
+        changed = False
         for index, region in enumerate(self._project.regions):
-            if region.region_id == self._selected_region_id:
+            if region.region_id in selected_ids:
                 self._remember_region_change()
                 self._project.regions[index] = ImageLabRegion(
                     region_id=region.region_id,
@@ -1009,10 +1064,44 @@ class ImageLabPage(QWidget):
                     color=region.color,
                     status=status,
                 )
-                self._mark_dirty()
-                self._refresh_regions()
-                self._status(f"{region.region_id} 已标记为{self._region_status_text(status)}")
-                return
+                changed = True
+        if changed:
+            self._mark_dirty()
+            self._refresh_regions()
+            self._status(f"已将 {len(selected_ids)} 个区域标记为{self._region_status_text(status)}")
+
+    def _mark_selected_regions_learned(self) -> None:
+        if self._project is None:
+            return
+        ids = self._selected_region_ids or ({self._selected_region_id} if self._selected_region_id else set())
+        targets = [region for region in self._project.regions if region.region_id in ids]
+        if not targets:
+            self._status("请先选择要加入学习的文字区域")
+            return
+        self._remember_region_change()
+        existing = {sample.region_id for sample in self._project.learning_samples}
+        for region in targets:
+            if region.status != "processed":
+                index = self._project.regions.index(region)
+                self._project.regions[index] = ImageLabRegion(
+                    region_id=region.region_id,
+                    polygon=region.polygon,
+                    confidence=region.confidence,
+                    color=region.color,
+                    status="processed",
+                )
+            if region.region_id not in existing:
+                self._project.learning_samples.append(
+                    ImageLabLearningSample(
+                        region_id=region.region_id,
+                        source_path=self._project.source_path,
+                        polygon=region.polygon,
+                        quality="processed" if region.status == "processed" else "confirmed",
+                    )
+                )
+        self._mark_dirty()
+        self._refresh_regions()
+        self._status(f"已将 {len(targets)} 个文字区域加入学习库")
 
     @staticmethod
     def _region_status_text(status: str) -> str:
@@ -1026,18 +1115,23 @@ class ImageLabPage(QWidget):
     def _process_confirmed_regions(self) -> None:
         if self._project is None or self.is_running:
             return
-        confirmed = [region for region in self._project.regions if region.status == "confirmed"]
+        selected_ids = self._selected_region_ids
+        confirmed = [
+            region for region in self._project.regions
+            if region.status == "confirmed" and (not selected_ids or region.region_id in selected_ids)
+        ]
         if not confirmed:
-            self._status("没有可处理的已确认区域")
+            self._status("所选区域中没有可优化的已确认文字")
             return
         self._remember_region_change()
+        target_ids = {region.region_id for region in confirmed}
         self._project.regions = [
             ImageLabRegion(
                 region_id=region.region_id,
                 polygon=region.polygon,
                 confidence=region.confidence,
                 color=region.color,
-                status="processed" if region.status == "confirmed" else region.status,
+                status="processed" if region.region_id in target_ids else region.status,
             )
             for region in self._project.regions
         ]
@@ -1979,7 +2073,9 @@ class ImageLabPage(QWidget):
             self._apply_button,
             self._cover_button,
             self._restore_button,
+            self._erase_button,
             self._brush_slider,
+            self._pressure_check,
             self._undo_button,
             self._clear_button,
             self._region_select_button,
@@ -1993,6 +2089,7 @@ class ImageLabPage(QWidget):
             self._region_restrict_check,
             self._region_margin_check,
             self._region_process_button,
+            self._learn_button,
             self._region_undo_button,
             self._export_result_button,
             self._export_layer_button,
