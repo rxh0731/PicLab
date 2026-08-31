@@ -88,6 +88,50 @@ def apply_theme(app: QApplication) -> None:
         QScrollBar:vertical {{ width: 10px; background: {COLORS['background']}; }}
         QScrollBar::handle:vertical {{ min-height: 28px; border-radius: 5px; background: #46515F; }}
         QStatusBar {{ color: {COLORS['muted']}; background: #12161C; }}
+        QFrame#imageLabTopBar {{
+            background: #273137;
+            border-bottom: 1px solid #46535A;
+        }}
+        QFrame#imageLabTopBar QLabel[role="pageTitle"] {{ color: #F3F7F5; font-size: 22px; }}
+        QFrame#imageLabTopBar QLabel[role="muted"] {{ color: #B5C2C2; }}
+        QLabel#imageLabProjectLabel {{ color: #D7E0DF; padding: 0 8px; }}
+        QFrame#imageLabWorkflowSidebar {{
+            background: #EEF2F0;
+            border-right: 1px solid #CAD3D0;
+        }}
+        QLabel#workflowTitle {{ color: #263238; font-size: 16px; font-weight: 700; }}
+        QLabel#workflowSubtitle {{ color: #66747A; font-size: 11px; }}
+        QFrame#workflowStepRow {{ background: transparent; border-left: 3px solid transparent; }}
+        QFrame#workflowStepRow:hover {{ background: #E1E9E6; }}
+        QFrame#workflowStepRow[active="true"] {{
+            background: #FFFFFF;
+            border-left-color: #168C9D;
+        }}
+        QLabel#workflowStepNumber {{
+            color: #536168;
+            border: 1px solid #AAB7B8;
+            border-radius: 12px;
+            min-width: 23px;
+            max-width: 23px;
+            min-height: 23px;
+            max-height: 23px;
+            font-size: 11px;
+        }}
+        QPushButton#workflowStepButton {{
+            color: #263238;
+            text-align: left;
+            min-height: 24px;
+            padding: 0;
+            border: 0;
+            background: transparent;
+            font-weight: 600;
+        }}
+        QPushButton#workflowStepButton:hover {{ color: #168C9D; }}
+        QLabel#workflowStepStatus {{ color: #6B787D; font-size: 11px; }}
+        QLabel#workflowHint {{ color: #66747A; font-size: 11px; padding: 8px; border-top: 1px solid #D1D9D6; }}
+        QFrame#imageLabFooter {{ background: #12171C; border-top: 1px solid #37404D; }}
+        QFrame#imageLabFooter QLabel#statusLabel {{ color: #A6B0BE; }}
+        QFrame#imageLabWorkflowSidebar QScrollBar:vertical {{ background: #EEF2F0; }}
         QToolTip {{
             color: {COLORS['text']};
             background: {COLORS['surface_alt']};

@@ -184,10 +184,14 @@ class ImageLabPage(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 14, 18, 16)
-        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        header = QHBoxLayout()
+        header_frame = QFrame()
+        header_frame.setObjectName("imageLabTopBar")
+        header = QHBoxLayout(header_frame)
+        header.setContentsMargins(18, 10, 18, 10)
+        header.setSpacing(10)
         title_box = QVBoxLayout()
         title_box.setSpacing(1)
         title = QLabel("图片实验室")
@@ -215,18 +219,25 @@ class ImageLabPage(QWidget):
         self._open_image_button.clicked.connect(self._choose_image)
         self._open_project_button.clicked.connect(self._choose_project)
         self._save_button.clicked.connect(self.save_project)
-        root.addLayout(header)
+        root.addWidget(header_frame)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        splitter.addWidget(self._build_controls())
+        splitter.setObjectName("imageLabWorkspace")
+        splitter.addWidget(self._build_workflow_sidebar())
         splitter.addWidget(self._build_preview_panel())
+        splitter.addWidget(self._build_controls())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([310, 1030])
+        splitter.setStretchFactor(2, 0)
+        splitter.setSizes([218, 760, 350])
         root.addWidget(splitter, 1)
 
-        footer = QHBoxLayout()
+        footer_frame = QFrame()
+        footer_frame.setObjectName("imageLabFooter")
+        footer = QHBoxLayout(footer_frame)
+        footer.setContentsMargins(14, 8, 14, 8)
+        footer.setSpacing(10)
         self._status_label = QLabel("打开图片后可生成清理预览")
         self._status_label.setObjectName("statusLabel")
         self._progress = QProgressBar()
@@ -239,7 +250,102 @@ class ImageLabPage(QWidget):
         footer.addWidget(self._status_label, 1)
         footer.addWidget(self._progress)
         footer.addWidget(self._stop_button)
-        root.addLayout(footer)
+        root.addWidget(footer_frame)
+
+    def _build_workflow_sidebar(self) -> QWidget:
+        """构建按处理阶段组织的工作流导航，不改变各阶段的后台处理逻辑。"""
+
+        sidebar = QFrame()
+        sidebar.setObjectName("imageLabWorkflowSidebar")
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(12, 18, 12, 12)
+        layout.setSpacing(4)
+        title = QLabel("处理流程")
+        title.setObjectName("workflowTitle")
+        layout.addWidget(title)
+        subtitle = QLabel("从原稿到 Photoshop")
+        subtitle.setObjectName("workflowSubtitle")
+        layout.addWidget(subtitle)
+        layout.addSpacing(10)
+
+        self._workflow_buttons: list[QPushButton] = []
+        self._workflow_status_labels: list[QLabel] = []
+        self._workflow_rows: list[QFrame] = []
+        steps = (
+            ("导入原稿", "原稿只读"),
+            ("检测文字", "等待原稿"),
+            ("人工校验", "等待检测"),
+            ("独立清理", "仅处理已确认区域"),
+            ("填白空白区", "生成白色清理层"),
+            ("导出分层文件", "PSD / PSB"),
+            ("Photoshop 精修", "保留编辑空间"),
+        )
+        for index, (name, detail) in enumerate(steps):
+            row = QFrame()
+            row.setObjectName("workflowStepRow")
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(8, 7, 8, 7)
+            row_layout.setSpacing(9)
+            number = QLabel("✓" if index == 0 else str(index + 1))
+            number.setObjectName("workflowStepNumber")
+            number.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            row_layout.addWidget(number)
+            column = QVBoxLayout()
+            column.setSpacing(0)
+            button = QPushButton(name)
+            button.setObjectName("workflowStepButton")
+            button.setFlat(True)
+            button.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+            button.clicked.connect(lambda _checked=False, step=index: self._workflow_step_clicked(step))
+            column.addWidget(button)
+            status = QLabel(detail)
+            status.setObjectName("workflowStepStatus")
+            column.addWidget(status)
+            row_layout.addLayout(column, 1)
+            layout.addWidget(row)
+            self._workflow_buttons.append(button)
+            self._workflow_status_labels.append(status)
+            self._workflow_rows.append(row)
+        layout.addStretch(1)
+        self._workflow_hint = QLabel("先确认文字轮廓，再开始独立清理")
+        self._workflow_hint.setObjectName("workflowHint")
+        self._workflow_hint.setWordWrap(True)
+        layout.addWidget(self._workflow_hint)
+        self._set_workflow_step(0)
+        return sidebar
+
+    def _set_workflow_step(self, index: int) -> None:
+        if not hasattr(self, "_workflow_buttons"):
+            return
+        for button_index, button in enumerate(self._workflow_buttons):
+            active = button_index == index
+            button.setProperty("active", button_index == index)
+            button.style().unpolish(button)
+            button.style().polish(button)
+            row = self._workflow_rows[button_index]
+            row.setProperty("active", active)
+            row.style().unpolish(row)
+            row.style().polish(row)
+
+    def _workflow_step_clicked(self, index: int) -> None:
+        """把流程导航映射到已有功能入口。"""
+
+        self._set_workflow_step(index)
+        if index == 1:
+            self._set_view_mode(VIEW_REGIONS)
+            if self._project is not None and self._region_worker is None:
+                self._detect_regions()
+        elif index == 2:
+            self._set_view_mode(VIEW_REGIONS)
+            self._toggle_region_select(True)
+        elif index == 3:
+            self._process_confirmed_regions()
+        elif index == 4:
+            self._set_view_mode(VIEW_LAYER)
+        elif index == 5:
+            self._choose_export("photoshop")
+        elif index == 6:
+            self._status("请在 Photoshop 中继续处理已导出的分层文件")
 
     def _build_controls(self) -> QWidget:
         scroll = QScrollArea()
@@ -725,6 +831,26 @@ class ImageLabPage(QWidget):
                 f"已拒绝 {counts['rejected']}"
             )
         self._region_summary.setText(text)
+        if hasattr(self, "_workflow_status_labels"):
+            self._workflow_status_labels[0].setText(
+                "原稿只读" if self._project is not None else "等待原稿"
+            )
+            self._workflow_status_labels[1].setText(
+                f"{len(regions)} 个实例" if regions else "等待检测"
+            )
+            self._workflow_status_labels[2].setText(
+                f"待复核 {counts['pending']} · 已确认 {counts['confirmed']}"
+                if regions
+                else "等待检测"
+            )
+            self._workflow_status_labels[3].setText(
+                f"已处理 {counts['processed']} 个" if counts["processed"] else "仅处理已确认区域"
+            )
+            self._workflow_hint.setText(
+                "文字轮廓已确认，可开始独立清理"
+                if counts["confirmed"]
+                else "先确认文字轮廓，再开始独立清理"
+            )
         selected = next(
             (
                 region
@@ -1840,6 +1966,10 @@ class ImageLabPage(QWidget):
         self._status(message)
 
     def _set_project_available(self, available: bool) -> None:
+        if hasattr(self, "_workflow_buttons"):
+            for index, button in enumerate(self._workflow_buttons):
+                # 导入阶段即使尚未打开图片也保持可见，其余阶段需等待项目。
+                button.setEnabled(available or index == 0)
         for widget in (
             self._save_button,
             self._strength_slider,
