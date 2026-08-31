@@ -193,29 +193,85 @@ def _refine_cell_to_ink(
     polygon: np.ndarray,
     mask: np.ndarray,
     *,
+    center: np.ndarray,
+    unit_major: np.ndarray,
+    unit_cross: np.ndarray,
     major_pitch: float,
     cross_pitch: float,
+    major_scale: float,
 ) -> np.ndarray:
-    """用当前网格单元内的墨迹重心消除少量 OCR/网格相位偏差。"""
+    """从网格单元内的墨迹生成带留白的多边形边界。"""
 
     height, width = mask.shape[:2]
-    x1 = max(0, int(np.floor(np.min(polygon[:, 0]))))
-    y1 = max(0, int(np.floor(np.min(polygon[:, 1]))))
-    x2 = min(width, int(np.ceil(np.max(polygon[:, 0]))) + 1)
-    y2 = min(height, int(np.ceil(np.max(polygon[:, 1]))) + 1)
+    base_half_major = major_pitch * 0.54 / max(0.5, major_scale)
+    base_half_cross = cross_pitch * 0.54
+    envelope = np.asarray(
+        [
+            center - unit_major * base_half_major - unit_cross * base_half_cross,
+            center - unit_major * base_half_major + unit_cross * base_half_cross,
+            center + unit_major * base_half_major + unit_cross * base_half_cross,
+            center + unit_major * base_half_major - unit_cross * base_half_cross,
+        ],
+        dtype=np.float32,
+    )
+    x1 = max(0, int(np.floor(np.min(envelope[:, 0]))))
+    y1 = max(0, int(np.floor(np.min(envelope[:, 1]))))
+    x2 = min(width, int(np.ceil(np.max(envelope[:, 0]))) + 1)
+    y2 = min(height, int(np.ceil(np.max(envelope[:, 1]))) + 1)
     if x2 <= x1 or y2 <= y1:
         return polygon
-    local = mask[y1:y2, x1:x2]
-    ys, xs = np.nonzero(local)
+    ys, xs = np.nonzero(mask[y1:y2, x1:x2])
     if xs.size < 4:
         return polygon
-    ink_center = np.asarray((x1 + float(np.mean(xs)), y1 + float(np.mean(ys))))
-    polygon_center = np.mean(polygon, axis=0)
-    shift = ink_center - polygon_center
-    # 字形本身可能偏旁不对称，只吸收小幅偏差，避免把网格跟着字形重心拉歪。
-    limit = np.asarray((cross_pitch * 0.18, major_pitch * 0.18), dtype=np.float32)
-    shift = np.clip(shift, -limit, limit)
-    return polygon + shift.astype(np.float32)
+    points = np.column_stack((x1 + xs.astype(np.float32), y1 + ys.astype(np.float32)))
+    relative = points - center.reshape(1, 2)
+    major_projection = relative @ unit_major.reshape(2, 1)
+    cross_projection = relative @ unit_cross.reshape(2, 1)
+    major_projection = major_projection.reshape(-1)
+    cross_projection = cross_projection.reshape(-1)
+    inside = (
+        (np.abs(major_projection) <= base_half_major)
+        & (np.abs(cross_projection) <= base_half_cross)
+    )
+    if not np.any(inside):
+        return polygon
+    ink_points = points[inside]
+    padding = max(2.0, min(8.0, min(major_pitch, cross_pitch) * 0.12))
+    hull = cv2.convexHull(np.rint(ink_points).astype(np.int32)).reshape(-1, 2)
+    if hull.shape[0] < 3:
+        return polygon
+    hull_center = np.mean(hull.astype(np.float32), axis=0)
+    directions = hull.astype(np.float32) - hull_center
+    lengths = np.linalg.norm(directions, axis=1, keepdims=True)
+    expanded = hull.astype(np.float32) + directions / np.maximum(lengths, 1.0) * padding
+    approximation = cv2.approxPolyDP(
+        expanded.reshape(-1, 1, 2),
+        max(0.8, padding * 0.32),
+        True,
+    ).reshape(-1, 2)
+    if approximation.shape[0] < 3:
+        approximation = expanded
+    # 保留一个网格范围内的上限，避免前景噪声把相邻字符整块连进来。
+    relative = approximation - center.reshape(1, 2)
+    major_projection = relative @ unit_major.reshape(2, 1)
+    cross_projection = relative @ unit_cross.reshape(2, 1)
+    major_projection = np.clip(
+        major_projection.reshape(-1),
+        -base_half_major,
+        base_half_major,
+    )
+    cross_projection = np.clip(
+        cross_projection.reshape(-1),
+        -base_half_cross,
+        base_half_cross,
+    )
+    return np.asarray(
+        [
+            center + unit_major * major_value + unit_cross * cross_value
+            for major_value, cross_value in zip(major_projection, cross_projection)
+        ],
+        dtype=np.float32,
+    )
 
 
 def _line_guided_candidates(
@@ -234,6 +290,7 @@ def _line_guided_candidates(
     if boxes.ndim != 3 or boxes.shape[1:] != (4, 2) or not scores:
         return ()
     line_items: list[_DetectedTextLine] = []
+    height, width = rgb.shape[:2]
     for box, score in zip(boxes, scores):
         horizontal_length = (
             np.linalg.norm(box[1] - box[0]) + np.linalg.norm(box[2] - box[3])
@@ -245,6 +302,21 @@ def _line_guided_candidates(
         major = max(horizontal_length, vertical_length)
         minor = min(horizontal_length, vertical_length)
         if major < 24.0 or minor < 3.0 or major / max(1.0, minor) < 2.2:
+            continue
+        # OCR 检测器有时会把页面边框、横线或跨栏噪声当成文字行。
+        # 只有框内确实存在足够墨迹时，才允许它参与整页网格推断。
+        left = max(0, int(np.floor(np.min(box[:, 0]))))
+        top = max(0, int(np.floor(np.min(box[:, 1]))))
+        right = min(width, int(np.ceil(np.max(box[:, 0]))) + 1)
+        bottom = min(height, int(np.ceil(np.max(box[:, 1]))) + 1)
+        if right <= left or bottom <= top:
+            continue
+        box_mask = np.zeros((bottom - top, right - left), dtype=np.uint8)
+        shifted = np.rint(box - (left, top)).astype(np.int32)
+        cv2.fillPoly(box_mask, [shifted], 1)
+        support = float(np.count_nonzero(mask[top:bottom, left:right] & (box_mask > 0)))
+        box_area = float(np.count_nonzero(box_mask))
+        if support / max(1.0, box_area) < 0.018:
             continue
         center = float(np.mean(box[:, 0] if vertical else box[:, 1]))
         line_items.append(
@@ -259,8 +331,27 @@ def _line_guided_candidates(
         )
     if len(line_items) < 2:
         return ()
-    dominant_vertical = sum(item.vertical for item in line_items) >= len(line_items) / 2
+    # 方向按覆盖长度加权，避免少量跨栏横框压过真正的竖排文字列。
+    orientation_weight = {
+        value: sum(item.major_length * max(0.2, item.score) for item in line_items if item.vertical == value)
+        for value in (False, True)
+    }
+    dominant_vertical = orientation_weight[True] > orientation_weight[False]
+    dominant_weight = orientation_weight[dominant_vertical]
+    total_weight = sum(orientation_weight.values())
+    if total_weight <= 0.0 or dominant_weight / total_weight < 0.62:
+        return ()
     lines = [item for item in line_items if item.vertical == dominant_vertical]
+    if len(lines) < 2:
+        return ()
+    typical_minor = float(np.median([item.minor_length for item in lines]))
+    typical_major = float(np.median([item.major_length for item in lines]))
+    lines = [
+        item
+        for item in lines
+        if 0.48 * typical_minor <= item.minor_length <= 2.1 * typical_minor
+        and item.major_length >= max(24.0, typical_major * 0.42)
+    ]
     retained, cross_pitch = _regularize_text_lines(lines)
     if len(retained) < 2 or cross_pitch <= 0.0:
         return ()
@@ -271,7 +362,6 @@ def _line_guided_candidates(
         lines=retained,
     )
 
-    height, width = rgb.shape[:2]
     output: list[TextRegionCandidate] = []
     for line in retained:
         box = line.box
@@ -294,7 +384,7 @@ def _line_guided_candidates(
         if cross_length <= 1.0:
             continue
         unit_cross = cross_vector / cross_length
-        half_cross = min(cross_length * 0.48, cross_pitch * 0.46)
+        half_cross = min(cross_length * 0.52, cross_pitch * 0.52)
         major_axis = 1 if vertical else 0
         axis_component = float(unit_major[major_axis])
         if abs(axis_component) < 0.5:
@@ -304,15 +394,53 @@ def _line_guided_candidates(
             float((height if vertical else width) - 1),
             float(np.max(box[:, major_axis])),
         )
-        first_index = int(np.floor((axis_start - major_phase) / major_pitch)) - 1
-        last_index = int(np.ceil((axis_end - major_phase) / major_pitch)) + 1
+        # 用当前文字行的投影重新寻找网格相位。整页投影容易被标题、页边线和
+        # 跨栏噪声影响，局部相位校正可避免框线在一行内逐格偏移。
+        line_left = max(0, int(np.floor(np.min(box[:, 0]))))
+        line_top = max(0, int(np.floor(np.min(box[:, 1]))))
+        line_right = min(width, int(np.ceil(np.max(box[:, 0]))) + 1)
+        line_bottom = min(height, int(np.ceil(np.max(box[:, 1]))) + 1)
+        if vertical:
+            line_projection = np.mean(mask[line_top:line_bottom, :], axis=1).astype(np.float32)
+        else:
+            line_projection = np.mean(mask[:, line_left:line_right], axis=0).astype(np.float32)
+        if (not vertical) and line_projection.size >= 5 and float(np.ptp(line_projection)) > 0.01:
+            smoothed = cv2.GaussianBlur(
+                line_projection.reshape(-1, 1),
+                (1, 0),
+                sigmaX=0.0,
+                sigmaY=max(0.7, major_pitch * 0.045),
+            ).reshape(-1)
+            sample_axis = np.arange(smoothed.size, dtype=np.float32)
+            phase_candidates = major_phase + np.linspace(-0.30, 0.30, 13) * major_pitch
+            best_phase = major_phase
+            best_cost = float("inf")
+            for phase in phase_candidates:
+                first = int(np.floor((axis_start - phase) / major_pitch)) - 1
+                last = int(np.ceil((axis_end - phase) / major_pitch)) + 1
+                boundaries = phase + np.arange(first, last + 1) * major_pitch
+                boundaries = boundaries[(boundaries >= axis_start) & (boundaries <= axis_end)]
+                if boundaries.size < 2:
+                    continue
+                centers = boundaries[:-1] + major_pitch * 0.5
+                boundary_level = float(np.mean(np.interp(boundaries, sample_axis, smoothed)))
+                center_level = float(np.mean(np.interp(centers, sample_axis, smoothed)))
+                cost = boundary_level - center_level * 0.26
+                if cost < best_cost:
+                    best_cost = cost
+                    best_phase = float(phase)
+            major_phase_for_line = best_phase
+        else:
+            major_phase_for_line = major_phase
+        first_index = int(np.floor((axis_start - major_phase_for_line) / major_pitch)) - 1
+        last_index = int(np.ceil((axis_end - major_phase_for_line) / major_pitch)) + 1
         for grid_index in range(first_index, last_index + 1):
-            axis_center = major_phase + (grid_index + 0.5) * major_pitch
+            axis_center = major_phase_for_line + (grid_index + 0.5) * major_pitch
             if not axis_start - major_pitch * 0.18 <= axis_center <= axis_end + major_pitch * 0.18:
                 continue
             distance = (axis_center - float(start_center[major_axis])) / axis_component
             center = start_center + unit_major * distance
-            half_major = major_pitch * 0.46 / abs(axis_component)
+            half_major = major_pitch * 0.52 / abs(axis_component)
             polygon_array = np.asarray(
                 [
                     center - unit_major * half_major - unit_cross * half_cross,
@@ -325,8 +453,12 @@ def _line_guided_candidates(
             polygon_array = _refine_cell_to_ink(
                 polygon_array,
                 mask,
+                center=center,
+                unit_major=unit_major,
+                unit_cross=unit_cross,
                 major_pitch=major_pitch,
                 cross_pitch=cross_pitch,
+                major_scale=abs(axis_component),
             )
             x1 = max(0, int(np.floor(np.min(polygon_array[:, 0]))))
             y1 = max(0, int(np.floor(np.min(polygon_array[:, 1]))))
@@ -353,6 +485,22 @@ def _line_guided_candidates(
             output.append(TextRegionCandidate(polygon, confidence, _overlay_color(mean_rgb)))
             if len(output) >= max_regions:
                 return tuple(output)
+    if not output:
+        return ()
+    # 网格结果必须覆盖 OCR 文字行中的主要前景；覆盖率过低通常意味着
+    # OCR 行框来自页边线或跨栏误识别，此时交给连通域回退更可靠。
+    line_area_mask = np.zeros((height, width), dtype=np.uint8)
+    for line in retained:
+        points = np.rint(line.box).astype(np.int32)
+        cv2.fillPoly(line_area_mask, [points], 1)
+    covered = np.zeros((height, width), dtype=np.uint8)
+    for candidate in output:
+        points = np.rint(np.asarray(candidate.polygon) * (width, height)).astype(np.int32)
+        cv2.fillPoly(covered, [points], 1)
+    relevant = mask & (line_area_mask > 0)
+    relevant_count = int(np.count_nonzero(relevant))
+    if relevant_count and int(np.count_nonzero(relevant & (covered > 0))) / relevant_count < 0.58:
+        return ()
     return tuple(output)
 
 
