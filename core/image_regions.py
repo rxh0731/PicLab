@@ -100,6 +100,8 @@ def _resolve_polygon_overlaps(
             for point in polygon
         )
         resolved.append(TextRegionCandidate(normalized, candidate.confidence, candidate.color))
+    if not resolved:
+        return tuple(candidates)
     return _separate_polygon_bounds(resolved, width, height)
 
 
