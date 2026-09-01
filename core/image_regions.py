@@ -31,6 +31,135 @@ class _DetectedTextLine:
     minor_length: float
 
 
+def _resolve_polygon_overlaps(
+    candidates: list[TextRegionCandidate],
+    width: int,
+    height: int,
+    foreground_mask: np.ndarray | None = None,
+) -> tuple[TextRegionCandidate, ...]:
+    """消除候选区域交叠，使一个像素只归属于一个文字区域。"""
+
+    if len(candidates) < 2:
+        return tuple(candidates)
+    masks: list[np.ndarray] = []
+    centers: list[np.ndarray] = []
+    overlap_found = False
+    for candidate in candidates:
+        points = np.rint(np.asarray(candidate.polygon, dtype=np.float32) * (width, height)).astype(np.int32)
+        mask = np.zeros((height, width), dtype=np.uint8)
+        if len(points) >= 3:
+            cv2.fillPoly(mask, [points], 1)
+        masks.append(mask)
+        centers.append(np.mean(points.astype(np.float32), axis=0) if len(points) else np.zeros(2, np.float32))
+    occupancy = np.sum(np.stack(masks, axis=0), axis=0)
+    overlap_found = bool(np.any(occupancy > 1))
+    if not overlap_found:
+        return tuple(candidates)
+    owner = np.full((height, width), -1, dtype=np.int16)
+    overlap_pixels = occupancy > 1
+    for index, mask in enumerate(masks):
+        only = (mask > 0) & ~overlap_pixels
+        owner[only] = index
+    ys, xs = np.nonzero(overlap_pixels)
+    if len(xs):
+        pixel_points = np.column_stack((xs, ys)).astype(np.float32)
+        for start in range(0, len(pixel_points), 20000):
+            batch = pixel_points[start : start + 20000]
+            distances = np.stack(
+                [np.sum((batch - center[None, :]) ** 2, axis=1) for center in centers],
+                axis=1,
+            )
+            active = np.stack([mask[ys[start : start + len(batch)], xs[start : start + len(batch)]] > 0 for mask in masks], axis=1)
+            distances[~active] = np.inf
+            owner[ys[start : start + len(batch)], xs[start : start + len(batch)]] = np.argmin(distances, axis=1)
+    resolved: list[TextRegionCandidate] = []
+    for index, candidate in enumerate(candidates):
+        assigned = (owner == index).astype(np.uint8)
+        original = masks[index]
+        if foreground_mask is not None:
+            original_ink = (original > 0) & (foreground_mask > 0)
+            assigned_ink = (assigned > 0) & (foreground_mask > 0)
+            # 不能为了消歧而裁掉该区域自己的笔画；这种情况下保留原边界，
+            # 后续人工复核仍可继续调整。
+            if np.count_nonzero(original_ink) and np.count_nonzero(assigned_ink) < np.count_nonzero(original_ink):
+                resolved.append(candidate)
+                continue
+        contours, _ = cv2.findContours(assigned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour = max(contours, key=cv2.contourArea) if contours else None
+        if contour is None or cv2.contourArea(contour) < 4.0:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        polygon = cv2.approxPolyDP(contour, max(1.0, perimeter * 0.02), True).reshape(-1, 2)
+        if len(polygon) < 3:
+            continue
+        normalized = tuple(
+            (
+                float(np.clip(point[0] / max(1, width - 1), 0.0, 1.0)),
+                float(np.clip(point[1] / max(1, height - 1), 0.0, 1.0)),
+            )
+            for point in polygon
+        )
+        resolved.append(TextRegionCandidate(normalized, candidate.confidence, candidate.color))
+    return _separate_polygon_bounds(resolved, width, height)
+
+
+def _separate_polygon_bounds(
+    candidates: list[TextRegionCandidate] | tuple[TextRegionCandidate, ...],
+    width: int,
+    height: int,
+) -> tuple[TextRegionCandidate, ...]:
+    """按相邻区域中心切开仍相交的安全边距，避免框线互相穿过。"""
+
+    if len(candidates) < 2:
+        return tuple(candidates)
+    polygons = [np.asarray(item.polygon, dtype=np.float32) * (width, height) for item in candidates]
+    for index in range(len(polygons)):
+        for other_index in range(index + 1, len(polygons)):
+            first, second = polygons[index], polygons[other_index]
+            first_left, first_top = np.min(first, axis=0)
+            first_right, first_bottom = np.max(first, axis=0)
+            second_left, second_top = np.min(second, axis=0)
+            second_right, second_bottom = np.max(second, axis=0)
+            overlap_x = min(first_right, second_right) - max(first_left, second_left)
+            overlap_y = min(first_bottom, second_bottom) - max(first_top, second_top)
+            if overlap_x <= 0.0 or overlap_y <= 0.0:
+                continue
+            first_center = np.mean(first, axis=0)
+            second_center = np.mean(second, axis=0)
+            if overlap_x <= overlap_y:
+                separator = float((first_center[0] + second_center[0]) * 0.5)
+                if first_center[0] <= second_center[0]:
+                    first[:, 0] = np.minimum(first[:, 0], separator + 0.49)
+                    second[:, 0] = np.maximum(second[:, 0], separator - 0.51)
+                else:
+                    first[:, 0] = np.maximum(first[:, 0], separator - 0.51)
+                    second[:, 0] = np.minimum(second[:, 0], separator + 0.49)
+            else:
+                separator = float((first_center[1] + second_center[1]) * 0.5)
+                if first_center[1] <= second_center[1]:
+                    first[:, 1] = np.minimum(first[:, 1], separator + 0.49)
+                    second[:, 1] = np.maximum(second[:, 1], separator - 0.51)
+                else:
+                    first[:, 1] = np.maximum(first[:, 1], separator - 0.51)
+                    second[:, 1] = np.minimum(second[:, 1], separator + 0.49)
+    separated: list[TextRegionCandidate] = []
+    for candidate, polygon in zip(candidates, polygons):
+        separated.append(
+            TextRegionCandidate(
+                tuple(
+                    (
+                        float(np.clip(point[0] / max(1, width - 1), 0.0, 1.0)),
+                        float(np.clip(point[1] / max(1, height - 1), 0.0, 1.0)),
+                    )
+                    for point in polygon
+                ),
+                candidate.confidence,
+                candidate.color,
+            )
+        )
+    return tuple(separated)
+
+
 @lru_cache(maxsize=1)
 def _rapidocr_engine() -> object:
     """延迟创建文字行检测器，避免图片实验室启动时加载模型。"""
@@ -484,7 +613,7 @@ def _line_guided_candidates(
             )
             output.append(TextRegionCandidate(polygon, confidence, _overlay_color(mean_rgb)))
             if len(output) >= max_regions:
-                return tuple(output)
+                return _resolve_polygon_overlaps(output, width, height, mask)
     if not output:
         return ()
     # 网格结果必须覆盖 OCR 文字行中的主要前景；覆盖率过低通常意味着
@@ -501,7 +630,7 @@ def _line_guided_candidates(
     relevant_count = int(np.count_nonzero(relevant))
     if relevant_count and int(np.count_nonzero(relevant & (covered > 0))) / relevant_count < 0.58:
         return ()
-    return tuple(output)
+    return _resolve_polygon_overlaps(output, width, height, mask)
 
 
 def _normalize_rgb(source: np.ndarray) -> np.ndarray:
@@ -680,7 +809,7 @@ def detect_text_regions(
                 color=_overlay_color(mean_rgb),
             )
         )
-    return tuple(output)
+    return _resolve_polygon_overlaps(output, width, height, mask)
 
 
 def region_mask(
